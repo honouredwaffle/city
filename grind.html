@@ -872,35 +872,16 @@ player.group.rotation.y=player.yaw;
 function P(k){ return new URLSearchParams(location.search).get(k)!==null; }
 const MANNEQUIN={ready:false, proto:null, h:1.8, minY:0, maxY:1.8, bob:null, src:''};
 const MANNEQUINS=[];   // pool of loaded human prototypes (boy + girl)
-/* per-material-role palettes -> recolour each cloned NPC so the crowd varies.
-   Material names come from the Blender export; matRole() maps them to a role. */
-const CHAR_MATPAL={
-  Top:   [0xe3644f,0x3fa9f5,0x3fbf8f,0x9a6dd6,0xe8913a,0x7fb8e0,0xd94f5e,0x46b060,0x2b3550,0x1c1c22,0xd8a930,0x8c1f24],
-  Shoes: [0x1c1f26,0xe8e8e8,0x8c1f24,0x2a2a5a,0x6a4a20,0xd8d8d8],
-  Hair:  [0x15151a,0x241b14,0x3a2c1e,0x6b4a2a,0x8a5a2a,0xa87a3a,0xd8b26a,0x8f8f96,0x6a1f1f,0x2f2440],
-  Skin:  [0xffffff,0xf6e3d0,0xecd0b4,0xdcb894,0xc9a074,0xf9ecdd,0xe6c39c],
-};
-/* map a GLB material name to a recolour ROLE (or null = leave it alone).
-   Checked most-specific first so e.g. Human.eyebrow003_mat -> Brow, not Skin. */
-function matRole(n){
-  if(!n) return null;
-  if(/eyebrow/i.test(n)) return 'Brow';
-  if(/eyelash/i.test(n)) return 'Lash';
-  if(/teeth/i.test(n)) return 'Teeth';
-  if(/casualsuit|sportsuit|elegantsuit|worksuit|hoodie|jacket|shirt|clothes|suit/i.test(n)) return 'Top';
-  if(/shoe|sneaker|boot/i.test(n)) return 'Shoes';
-  if(/short\d|long\d|bob\d|ponytail|afro|braid|hair/i.test(n)) return 'Hair';
-  if(/^human_mat$|human\.?mat$|lips|ears|nipple|nails|skin/i.test(n)) return 'Skin';
-  if(/^eye/i.test(n) || /_eye$/i.test(n)) return 'Eye';
-  return null;
-}
-/* apply a role->colour look to every mesh under root. */
-function applyLook(root, look){
+/* KEEP the Blender-material look verbatim — the DESIGN IS the texture (blue tee +
+   orange trim, blue denim, hair colour). Earlier we REPLACED the colours with flat
+   palette values, which washed the outfit design out and made it look "embedded".
+   Now we only nudge the overall SHADE a hair per NPC so the crowd isn't 100%
+   identical, and the player keeps the exact Blender look. */
+function tintNPC(root, f){
+  if(!f || Math.abs(f-1)<0.02) return;
   root.traverse(o=>{ if(!o.isMesh) return;
     const mats=Array.isArray(o.material)?o.material:[o.material];
-    const out=mats.map(m=>{ const role=matRole(m.name); if(!role) return m;
-      const col=look[role]; if(col===undefined||col===null) return m;
-      const nm=m.clone(); nm.color.setHex(col); return nm; });
+    const out=mats.map(m=>{ if(!m.color) return m; const nm=m.clone(); nm.color.multiplyScalar(f); return nm; });
     o.material = out.length===1?out[0]:out;
   });
 }
@@ -959,8 +940,7 @@ function buildSkinnedPed(x,z,targetHeight,mk){
   const s=target/mk.h;
   root.scale.setScalar(s);
   root.position.y=-mk.minY*s;                 // feet on the ground
-  applyLook(root, { Top:pck(CHAR_MATPAL.Top), Shoes:pck(CHAR_MATPAL.Shoes),
-                    Hair:pck(CHAR_MATPAL.Hair), Skin:pck(CHAR_MATPAL.Skin) });
+  tintNPC(root, rnd(0.86,1.08));   // subtle shade variation only — keep the design
   const bones={};
   root.traverse(o=>{ if(o.isBone){ const k=_boneKey(o.name); if(!bones[k]) bones[k]=o; } });
   for(const k in bones){ const b=bones[k]; b.userData.rest=b.quaternion.clone(); b.userData.restPos=b.position.clone(); }
@@ -1060,12 +1040,56 @@ function aimBone(B,name,dx,dy,dz){
   const r=new THREE.Quaternion().setFromUnitVectors(dRest,dNew);
   b.quaternion.copy(r).multiply(b.userData.rest);
 }
+/* aimBoneFrame = aimBone + explicit ROLL: the bone's local +Y points at D and its
+   local +X is forced toward S (both given in body space). Needed for joints whose
+   HINGE is a fixed local axis (arms/elbows), so the hinge stays in a known plane.
+   Q_local = parentBody^-1 * Target  (kQ is parentBody^-1, captured at rest). */
+function aimBoneFrame(B,name,D,S){
+  const b=B[name]; if(!b||!b.userData.rest||!b.userData.kQ) return;
+  const y=new THREE.Vector3(D.x,D.y,D.z).normalize();
+  const x=new THREE.Vector3(S.x,S.y,S.z);
+  x.sub(y.clone().multiplyScalar(x.dot(y)));
+  if(x.lengthSq()<1e-8) x.set(0,0,1).sub(y.clone().multiplyScalar(y.z));
+  x.normalize();
+  const z=new THREE.Vector3().crossVectors(x,y).normalize();
+  const m=new THREE.Matrix4().makeBasis(x,y,z);
+  const qT=new THREE.Quaternion().setFromRotationMatrix(m);
+  b.quaternion.copy(b.userData.kQ).multiply(qT);
+}
 /* aim an upper arm: hang = radians DOWN from horizontal, fwd = forward/back swing
-   (+ forward). Left is +X, right is -X in the character frame. */
+   (+ forward). Left is +X, right is -X in the character frame.
+   Records the arm's body orientation on the bone so aimElbow() can bend the forearm
+   RELATIVE to the (already-aimed) upper arm — that keeps the elbow in the sagittal
+   plane instead of folding the hands across the chest. */
 function aimArm(B,side,hang,fwd){
-  const pre=(side==='L'?'Left':'Right');
-  const lat=(side==='L'?1:-1), cl=Math.cos(hang), sl=Math.sin(hang);
-  aimBone(B, pre+'Arm', lat*cl, -sl, fwd);
+  const pre=(side==='L'?'Left':'Right'), lat=(side==='L'?1:-1);
+  const D=new THREE.Vector3(lat*Math.cos(hang), -Math.sin(hang), fwd).normalize();
+  const T=_frameQuat(D, new THREE.Vector3(lat,0,0));
+  const ba=B[pre+'Arm']; if(!ba||!ba.userData.kQ) return;
+  ba.quaternion.copy(ba.userData.kQ).multiply(T);
+  ba.userData.Tarm=T;
+}
+/* aim the forearm: bend the elbow by `bend` radians toward the FRONT of the body,
+   measured from the current upper-arm direction. Sagittal-plane elbow. */
+function aimElbow(B,side,bend){
+  const pre=(side==='L'?'Left':'Right'), lat=(side==='L'?1:-1);
+  const ba=B[pre+'Arm'], bf=B[pre+'ForeArm'];
+  if(!ba||!bf||!ba.userData.Tarm) return;
+  const Tarm=ba.userData.Tarm;
+  const dArm=new THREE.Vector3(0,1,0).applyQuaternion(Tarm);
+  const qb=new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), -bend);
+  const dFore=dArm.clone().applyQuaternion(qb).normalize();
+  const Tf=_frameQuat(dFore, new THREE.Vector3(lat,0,0));
+  bf.quaternion.copy(Tarm).invert().multiply(Tf);
+}
+/* build a quaternion whose +Y = D and +X ~ S (both body-space). */
+function _frameQuat(D,S){
+  const y=D.clone().normalize();
+  const x=S.clone(); x.sub(y.clone().multiplyScalar(x.dot(y)));
+  if(x.lengthSq()<1e-8) x.set(0,0,1).sub(y.clone().multiplyScalar(y.z));
+  x.normalize();
+  const z=new THREE.Vector3().crossVectors(x,y).normalize();
+  return new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(x,y,z));
 }
 /* aim a forearm: bend = elbow flexion (0 straight .. ~1.6 = right angle), fwd carries
    the arm's swing so the forearm follows the upper arm. */
@@ -1096,13 +1120,13 @@ function animateSkinned(p, phase, amt, run){
   // --- thigh swing from the hip. Asymmetric: a run throws the thigh far forward
   //     at the knee-drive but only ~half that far back, so the foot can actually
   //     reach the ground on stance instead of hovering at hip height. ---
-  const A=0.60+0.55*R, bias=0.14*R, backC=0.60, adduct=0.05+0.06*R;
+  const A=0.52+0.30*R, bias=0.12*R, backC=0.62, adduct=0.05+0.06*R;
   const swing=(sv)=>{ const r=A*sv; return bias + (r>0? r : r*backC); };
-  // --- legs: AIM each bone in body space (+Z fwd / +Y up / +X = char's LEFT) so it
-  //     works on a T-pose OR an A-pose rig. thighL/thighR > 0 = leg swung FORWARD ---
+  // --- legs: LOCAL-axis swing (verified on this Mixamo rig). The rest pose is the
+  //     same straight-down leg for T-pose or A-pose, so these axes never changed.
   const thighL=swing(s), thighR=swing(-s);
-  aimBone(B,'LeftUpLeg',  -adduct*0.5, -Math.cos(thighL), Math.sin(thighL));  // slight adduction
-  aimBone(B,'RightUpLeg',  adduct*0.5, -Math.cos(thighR), Math.sin(thighR));  // -> legs track under
+  sbm(B,'LeftUpLeg', [['X',thighL],['Z', -adduct]]);
+  sbm(B,'RightUpLeg',[['X',thighR],['Z', adduct]]);
   // --- knees: one flex per step, PEAKED MID-SWING (thigh vertical, heel up to the
   //     butt) then extending as the thigh drives forward to reach for the ground.
   //     Plus a smaller absorption flex at stance contact. The kernel is asymmetric
@@ -1114,18 +1138,16 @@ function animateSkinned(p, phase, amt, run){
     const d=wrapPi(ph-BASE), w=(d<0? d*1.50 : d*1.20);
     const sw=Math.pow(0.5+0.5*Math.cos(w),2.0);
     const ab=Math.pow(Math.max(0,Math.cos(wrapPi(ph-ABS))),1.6);
-    return 0.05 + (0.40+1.05*R)*sw + (0.08+0.42*R)*ab;
+    return 0.05 + (0.40+0.80*R)*sw + (0.08+0.36*R)*ab;
   };
   const kneeL=kneeRaw(phase, SWING_PK, CONTACT_PK), kneeR=kneeRaw(phase, SWING_PK+Math.PI, CONTACT_PK+Math.PI);
-  // shin swings BACK from the thigh by the knee angle (heel toward the butt); keep a
-  // downward floor so the shin can never flip up through the thigh.
-  const shinL=thighL-kneeL*a, shinR=thighR-kneeR*a;
-  aimBone(B,'LeftLeg',  -0.02, -Math.max(0.12,Math.cos(shinL)), Math.sin(shinL));
-  aimBone(B,'RightLeg',  0.02, -Math.max(0.12,Math.cos(shinR)), Math.sin(shinR));
-  // --- ankles: point the toe down on push-off, lift it on the forward reach ---
+  // knee flexes BACKWARD (heel toward butt) => negative local X on this rig
+  sb(B,'LeftLeg', -kneeL*a - 0.04*(1-a),'X');
+  sb(B,'RightLeg',-kneeR*a - 0.04*(1-a),'X');
+  // --- ankles: point the toe on push-off, lift it on the forward reach ---
   const ank=(sv)=>((0.30+0.22*R)*Math.max(0,-sv) - (0.24+0.16*R)*Math.max(0,sv))*a;
-  aimBone(B,'LeftFoot',  -0.03, -Math.sin(0.18+ank(s)),  Math.cos(0.18+ank(s)));
-  aimBone(B,'RightFoot',  0.03, -Math.sin(0.18+ank(-s)), Math.cos(0.18+ank(-s)));
+  sb(B,'LeftFoot', -ank(s),'X');
+  sb(B,'RightFoot',-ank(-s),'X');
   // --- pelvis. Two parts:
   //   PLANT: aim a support leg at (thigh th, knee k); its foot sits
   //     Lt*cos(th)+Ls*cos(th-k) below the hip vs Lt+Ls when straight, so its lift is
@@ -1135,20 +1157,20 @@ function animateSkinned(p, phase, amt, run){
   const Lt=0.44, Ls=0.44;
   const footLift=(th,k)=>{ const sh=th-k; return Lt*(1-Math.cos(th)) + Ls*(1-Math.cos(sh)); };
   const supportLift=Math.min(footLift(thighL,kneeL), footLift(thighR,kneeR));
-  const plant=clamp(supportLift*(1-0.55*R)*a, 0, 0.30);
-  const lift=0.075*R*Math.max(0,-c2)*a;
+  const plant=clamp(supportLift*(1-0.72*R)*a, 0, 0.22);
+  const lift=0.05*R*Math.max(0,-c2)*a;
   sbpUp(B,'Hips',lift - plant);
   sbm(B,'Hips',[['Y', s*(0.06+0.09*R)*a],['Z', c2*0.035*a]]);
   // --- arms: AIM in body space so the A-pose rest can't throw them out into a
   //     "hands out" pose. hang = radians DOWN from horizontal; swing opposite legs ---
-  const AA=(0.45+0.65*R)*a;
-  const hangA=1.30+0.05*R, fwdL=-s*AA, fwdR=s*AA;
+  const AA=(0.55+0.85*R)*a, BIAS=0.30*a, fwdL=-s*AA-BIAS, fwdR=s*AA-BIAS;
+  const hangA=1.30+0.05*R;
   aimArm(B,'L',hangA,fwdL);
   aimArm(B,'R',hangA,fwdR);
-  // elbows held bent when running (reference: ~90deg), gently pumping
-  const EB=0.42+(0.30+0.75*R)*a + (0.24*R*a)*Math.abs(c2*0.5);
-  aimFore(B,'L',EB + 0.22*R*a*Math.max(0,-s), fwdL);
-  aimFore(B,'R',EB + 0.22*R*a*Math.max(0, s), fwdR);
+  // elbows: LOCAL +X is the flex axis on this rig (verified) -> stays with the arm
+  const EB=0.35+(0.40+0.70*R)*a + (0.20*R*a)*Math.abs(c2*0.5);
+  aimElbow(B,'L', EB + 0.20*R*a*Math.max(0,-s));
+  aimElbow(B,'R', EB + 0.20*R*a*Math.max(0, s));
   // --- torso: forward lean grows with speed, shoulders twist AGAINST the pelvis ---
   sb(B,'Spine', (0.05+0.21*R)*a + 0.02*(1-a),'X');
   sb(B,'Spine1', -s*(0.09+0.07*R)*a,'Y');
@@ -1165,17 +1187,13 @@ function idleSkinned(p, t){
   const B=p.bones; if(!B) return;
   const br=(t!==undefined? Math.sin(t*1.5) : 0);       // gentle breathing
   const sw=(t!==undefined? Math.sin(t*0.45) : 0);      // slow weight shift
-  const k=0.10;                                   // soft-knee stance
-  aimBone(B,'LeftUpLeg', -0.02, -1, 0);           // legs straight down, neutral
-  aimBone(B,'RightUpLeg', 0.02, -1, 0);
-  aimBone(B,'LeftLeg', -0.02, -Math.cos(-k), Math.sin(-k));
-  aimBone(B,'RightLeg', 0.02, -Math.cos(-k), Math.sin(-k));
-  aimBone(B,'LeftFoot', -0.03, -Math.sin(0.18), Math.cos(0.18));
-  aimBone(B,'RightFoot', 0.03, -Math.sin(0.18), Math.cos(0.18));
+  sb(B,'LeftUpLeg',0,'X'); sb(B,'RightUpLeg',0,'X');
+  sb(B,'LeftLeg',-0.06,'X'); sb(B,'RightLeg',-0.06,'X');   // soft-knee stance
+  sb(B,'LeftFoot',0,'X'); sb(B,'RightFoot',0,'X');
   sbm(B,'Hips',[['Z', sw*0.02]]); sbpUp(B,'Hips',0);
   aimArm(B,'L', 1.30+br*0.02, -0.05);
   aimArm(B,'R', 1.30-br*0.02, -0.05);
-  aimFore(B,'L',0.30+br*0.03,-0.05); aimFore(B,'R',0.30-br*0.03,-0.05);
+  aimElbow(B,'L',0.30+br*0.03); aimElbow(B,'R',0.30-br*0.03);
   sb(B,'Spine',0.04+br*0.02,'X'); sb(B,'Spine1',0,'Y'); sb(B,'Spine2',0,'Y');
   sb(B,'Neck',0,'X');
 }
@@ -1187,62 +1205,52 @@ function poseJumpSkinned(p, h, rising){
   const k=clamp(h,0,1);
   let hip,kneeL,kneeR,ankle,armX,armZ,elbow,lean;
   if(rising){
-    hip   = 0.62 - 1.50*k;      // drive the thigh up as we tuck
-    kneeL = 0.30 + 1.45*k;      // knees fold up to ~100deg
-    kneeR = 0.20 + 1.20*k;
-    ankle = 0.50 - 0.75*k;      // point the toes off the ground, then tuck
+    hip   = 0.20 + 1.10*k;      // +X = thigh forward/UP on this rig -> knees drive up
+    kneeL = 0.25 + 1.15*k;      // knees fold up
+    kneeR = 0.18 + 0.95*k;
+    ankle = 0.35*(1-k);         // toe comes off the ground
     armX  = -0.95 - 0.55*k;     // arms swing up/through
     armZ  = 0.10 + 0.25*k;
     elbow = 0.35 + 0.55*k;
     lean  = 0.20 - 0.26*k;
   } else {
-    hip   = -0.55 + 0.80*k;     // legs reach down to land
-    kneeL = 0.95 - 0.55*k;
-    kneeR = 0.75 - 0.40*k;
-    ankle = -0.25 + 0.18*k;
+    hip   = 0.75 - 0.35*k;      // legs reach down to land
+    kneeL = 0.95 - 0.50*k;
+    kneeR = 0.75 - 0.35*k;
+    ankle = 0.10 + 0.10*k;
     armX  = -1.15 + 1.25*k;     // arms come down for balance
     armZ  = 0.30 - 0.20*k;
     elbow = 0.60 + 0.25*k;
     lean  = 0.04 + 0.12*k;
   }
-  const hipR=hip*0.85+0.08;
-  aimBone(B,'LeftUpLeg', -0.03, -Math.cos(hip), Math.sin(hip));
-  aimBone(B,'RightUpLeg', 0.03, -Math.cos(hipR), Math.sin(hipR));
-  aimBone(B,'LeftLeg', -0.02, -Math.max(0.12,Math.cos(hip-kneeL)), Math.sin(hip-kneeL));
-  aimBone(B,'RightLeg', 0.02, -Math.max(0.12,Math.cos(hipR-kneeR)), Math.sin(hipR-kneeR));
-  aimBone(B,'LeftFoot', -0.03, -Math.sin(0.18+ankle), Math.cos(0.18+ankle));
-  aimBone(B,'RightFoot', 0.03, -Math.sin(0.18+ankle*0.65), Math.cos(0.18+ankle*0.65));
+  sb(B,'LeftUpLeg',hip,'X');  sb(B,'RightUpLeg',hip*0.85+0.05,'X');
+  sb(B,'LeftLeg',-kneeL,'X'); sb(B,'RightLeg',-kneeR,'X');
+  sb(B,'LeftFoot',ankle,'X'); sb(B,'RightFoot',ankle*0.7,'X');
   sbm(B,'Hips',[['X',lean*0.5]]); sbpUp(B,'Hips',0);
   aimArm(B,'L', 0.92+armX, -armZ);
   aimArm(B,'R', 0.92+armX*0.9, -armZ);
-  aimFore(B,'L',elbow,-armZ); aimFore(B,'R',elbow*0.9,-armZ);
+  aimElbow(B,'L',elbow); aimElbow(B,'R',elbow*0.9);
   sb(B,'Spine',lean,'X'); sb(B,'Spine1',0,'Y'); sb(B,'Spine2',0,'Y'); sb(B,'Neck',-lean*0.5,'X');
 }
 /* Landing absorb on the skinned rig. t 1 -> 0 = deep crouch -> stand. */
 function poseLandSkinned(p, t){
   const B=p.bones; if(!B) return;
   const a=clamp(t,0,1);
-  const hL=-0.38*a, hR=-0.30*a, kL=1.25*a, kR=1.00*a;
-  aimBone(B,'LeftUpLeg', -0.03, -Math.cos(hL), Math.sin(hL));
-  aimBone(B,'RightUpLeg', 0.03, -Math.cos(hR), Math.sin(hR));
-  aimBone(B,'LeftLeg', -0.02, -Math.max(0.12,Math.cos(hL-kL)), Math.sin(hL-kL));   // knees bend to absorb
-  aimBone(B,'RightLeg', 0.02, -Math.max(0.12,Math.cos(hR-kR)), Math.sin(hR-kR));
-  aimBone(B,'LeftFoot', -0.03, -Math.sin(0.18-0.40*a), Math.cos(0.18-0.40*a));
-  aimBone(B,'RightFoot', 0.03, -Math.sin(0.18-0.32*a), Math.cos(0.18-0.32*a));
+  sb(B,'LeftUpLeg',0.30*a,'X'); sb(B,'RightUpLeg',0.24*a,'X');   // thigh forward into the crouch
+  sb(B,'LeftLeg',-1.25*a,'X');  sb(B,'RightLeg',-1.00*a,'X');    // knees bend to absorb
+  sb(B,'LeftFoot',0.35*a,'X');  sb(B,'RightFoot',0.28*a,'X');
   sbm(B,'Hips',[['X',0.10*a]]); sbpUp(B,'Hips',-0.06*a);     // pelvis drops into the crouch
   aimArm(B,'L',0.92-0.55*a, -0.30*a);           // arms swing forward for balance
   aimArm(B,'R',0.92-0.45*a, -0.30*a);
-  aimFore(B,'L',0.95*a,-0.30*a); aimFore(B,'R',0.80*a,-0.30*a);
+  aimElbow(B,'L',0.95*a); aimElbow(B,'R',0.80*a);
   sb(B,'Spine',0.26*a,'X'); sb(B,'Spine1',0,'Y'); sb(B,'Spine2',0,'Y'); sb(B,'Neck',-0.12*a,'X');
 }
 /* ---- the PLAYER is a skinned character from the same pool (boy/girl) ----
-   Fixed jacket colours so he reads as "you", not a random crowd NPC. */
-const PLAYER_LOOK={ Top:0xd8452f, Pants:0x2b3a55, Shoes:0xf0f0f0, Hair:0x241b14, Skin:0xf6e3d0 };
+   Native Blender look (no recolour) so he matches the Blender render exactly. */
 function makeSkinnedPlayer(){
   const old=player.group;
   const np=buildSkinnedPed(player.pos.x, player.pos.z, 1.82);
   np.bones = np.root.userData.bones;
-  applyLook(np.root, PLAYER_LOOK);   // fixed player colours (no random crowd palette)
   const wrap=np.group;
   const ip=peds.indexOf(np); if(ip>=0) peds.splice(ip,1);   // not a wandering ped
   player.skinned=true; player.root=np.root; player.bones=np.bones; player.restToe=np.restToe;
@@ -2541,7 +2549,7 @@ addEventListener('resize',()=>{
 if('ontouchstart' in window || innerWidth<900) joyEl.classList.add('show');
 
 /* expose for debugging/testing */
-window.GRIND = { S, PLACES, player, cars, peds, cops, traffic:TRAFFIC, cam, camera, scene, THREE, solids, INTERSECTIONS, CROSSWALKS, ROAD, lightState, onRoad, inCrosswalk, walkable, startShift, applyJob, buy, addHeat, doAction, enterCar, exitCar, MG, openPhone, selectTab, nearestTarget, usePlace, mug, punch, hurtPed, updateCombat, updateTraffic, tryJump, setSprint, animateWalk, poseJump, poseLand, idlePose, buildHumanoid, buildPed, buildSkinnedPed, animateSkinned, idleSkinned, poseJumpSkinned, poseLandSkinned, makeSkinnedPlayer, MANNEQUIN, MANNEQUINS, aimBone, aimArm, aimFore, reloadPeds, groundClampOne, measureBobAxis, setPause:(v)=>{paused=!!v;}, get paused(){return paused;}, get jumpY(){return jumpY;}, get sprint(){return sprint;}, get nearTarget(){return nearTarget;}, get playerHp(){return playerHp;} };
+window.GRIND = { S, PLACES, player, cars, peds, cops, traffic:TRAFFIC, cam, camera, scene, THREE, solids, INTERSECTIONS, CROSSWALKS, ROAD, lightState, onRoad, inCrosswalk, walkable, startShift, applyJob, buy, addHeat, doAction, enterCar, exitCar, MG, openPhone, selectTab, nearestTarget, usePlace, mug, punch, hurtPed, updateCombat, updateTraffic, tryJump, setSprint, animateWalk, poseJump, poseLand, idlePose, buildHumanoid, buildPed, buildSkinnedPed, animateSkinned, idleSkinned, poseJumpSkinned, poseLandSkinned, makeSkinnedPlayer, MANNEQUIN, MANNEQUINS, aimBone, aimBoneFrame, aimArm, aimElbow, aimFore, reloadPeds, groundClampOne, measureBobAxis, setPause:(v)=>{paused=!!v;}, get paused(){return paused;}, get jumpY(){return jumpY;}, get sprint(){return sprint;}, get nearTarget(){return nearTarget;}, get playerHp(){return playerHp;} };
 </script>
 </body>
 </html>
